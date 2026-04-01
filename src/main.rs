@@ -24,8 +24,8 @@ impl Command {
     /// 1、匹配枚举类型
     /// 2、执行对应的数据库操作
     /// 3、返回String类型
-    fn execute(db: &mut HashMap<String, String>, cmd: &Command) -> String {
-        match cmd {
+    fn execute(&self, db: &mut HashMap<String, String>) -> String {
+        match self {
             Command::Set(key, value) => {
                 db.insert(key.clone(), value.clone());
                 "+OK\r\n".to_string()
@@ -71,10 +71,22 @@ fn handle_stream(stream: &mut TcpStream, db: &mut HashMap<String, String>) -> st
             continue;
         }
         let response = match Command::from_str(trimed_cmd) {
-            Ok(cmd) => Command::execute(db, &cmd),
+            Ok(cmd) => cmd.execute(db),
             Err(e) => format!("-ERR {}\r\n", e),
         };
         stream.write_all(response.as_bytes())?;
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_parse_set() {
+        let cmd = Command::from_str("set key value").unwrap();
+        matches!(cmd, Command::Set(_, _));
+    }
 }

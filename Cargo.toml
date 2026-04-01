@@ -2,5 +2,7 @@
 name = "mini_redis"
 version = "0.1.0"
 edition = "2021"
+description = "A simple Redis implementation in Rust (synchronous)"
+authors = ["bug010101"]
 
 [dependencies]
