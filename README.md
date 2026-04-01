@@ -2,18 +2,17 @@
 
 一个用 Rust 实现的简单 Redis 服务器（同步版本）
 
-## 编译运行
+## 功能
+- SET key value - 设置键值对
+- GET key - 获取值
 
+## 编译运行
+\`\`\`bash
 cargo run
+\`\`\`
 
 ## 测试
-
-cargo test
-
-## 本地使用
-
-> nc localhost 6379
-> set 7 7
-
-> nc localhost 6379
-> get 7
+\`\`\`bash
+echo "set name rust" | nc localhost 6379
+echo "get name" | nc localhost 6379
+\`\`\`
