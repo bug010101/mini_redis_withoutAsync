@@ -1,65 +1,80 @@
-use std::{collections::HashMap, io::{Read, Write}, net::{TcpListener, TcpStream}};
+use std::{collections::HashMap, io::{BufRead, BufReader, Write}, net::{TcpListener, TcpStream}};
 
+enum Command {
+    Set(String, String),
+    Get(String),
+    // Del(String),
+    // Exists(String),
+}
+
+impl Command {
+    /// 解析&str类型的命令，返回Result<Command, String>类型
+    /// 1、将&str根据空格划分为数组
+    /// 2、对数组进行切片获取每部分，对比获取对应的枚举类型
+    fn from_str(line: &str) -> Result<Self, String> {
+        let parts:Vec<&str> = line.split_whitespace().collect();
+        match parts.as_slice() {
+            ["set", key, value] => Ok(Command::Set(key.to_string(), value.to_string())),
+            ["get", key] => Ok(Command::Get(key.to_string())),
+            _ => Err("unknown command".to_string()),
+        }
+    }
+
+    /// 输入一个处理好的命令，执行命令
+    /// 1、匹配枚举类型
+    /// 2、执行对应的数据库操作
+    /// 3、返回String类型
+    fn execute(db: &mut HashMap<String, String>, cmd: &Command) -> String {
+        match cmd {
+            Command::Set(key, value) => {
+                db.insert(key.clone(), value.clone());
+                "+OK\r\n".to_string()
+            },
+            Command::Get(key) => {
+                match db.get(key) {
+                    Some(v) => format!("${}\r\n{}\r\n", v.len(), v),
+                    None => "$-1\r\n".to_string(),
+                }
+            }
+        }
+    }
+}
 
 fn main() -> std::io::Result<()>{
-    // 先生成数据库对象
-    let mut db: HashMap<String, String> = HashMap::new();
-    let listener = TcpListener::bind("0.0.0.0:6379")?;
+    let mut db: HashMap<String, String> = HashMap::new(); // 生成数据库对象
+    let listener = TcpListener::bind("0.0.0.0:6379")?; // 绑定listerner
+    // 同步处理每个stream流
     for stream in listener.incoming() {
         let mut stream = stream?;
-        handle_stream(&mut stream, &mut db).unwrap();
+        let _ = handle_stream(&mut stream, &mut db);
     }
-    
     Ok(())
 }
 
 /// 给定TcpStream，数据库
-/// 对数据库进行操作
+/// 使用BufReader处理连接
+/// 1、根据stream连接获取reader对象
+/// 2、开启循环，读取每个命令直到没有任何命令输入为止
+/// 3、将输入的命令进行处理，判断，解析，执行
+/// 4、将处理的命令传回连接返回给客户端
 fn handle_stream(stream: &mut TcpStream, db: &mut HashMap<String, String>) -> std::io::Result<()>{
-    let mut buffer = [0u8; 1024]; // 获取缓冲区
-    let mut partial = String::new(); // 逐块拼接
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
     loop {
-        let n = stream.read(&mut buffer)?; // 读入缓冲区
+        line.clear();
+        let n = reader.read_line(&mut line)?;
         if n == 0 {
             break;
         }
-        let cmd = String::from_utf8_lossy(&buffer[..n]); // 获取读入的内容
-        partial.push_str(&cmd); // 每次读入的内容都放入拼接块
-        // 处理包含多个命令的行
-        handle_multi_raw(&mut partial, db, stream);
-    }
-    Ok(())
-}
-
-/// 处理包含多个命令的行
-fn handle_multi_raw(partial: &mut String, db: &mut HashMap<String, String>, stream: &mut TcpStream) {
-    while let Some(pos) = partial.find('\n') {
-        let line = partial[..pos].trim_end_matches(&['\r', '\n'][..]).to_string();
-        partial.drain(..=pos); // 删除已经处理的行
-        if line.is_empty() {
+        let trimed_cmd = line.trim();
+        if trimed_cmd.is_empty() {
             continue;
         }
-        let response = execute_cmd(db, &line).unwrap();
-        stream.write_all(response.as_bytes()).unwrap();
-        stream.write_all(b"\r\n").unwrap();
+        let response = match Command::from_str(trimed_cmd) {
+            Ok(cmd) => Command::execute(db, &cmd),
+            Err(e) => format!("-ERR {}\r\n", e),
+        };
+        stream.write_all(response.as_bytes())?;
     }
-}
-
-
-/// 输入一个处理好命令，执行命令
-/// 将数据进行分割得到集合
-/// 对集合进行匹配
-/// 进行数据库操作并返回用户提示
-fn execute_cmd(db: &mut HashMap<String, String>, line: &String) -> Option<String>{
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    match parts.as_slice() {
-        ["set", key, value] => {
-            db.insert(key.to_string(), value.to_string());
-            Some("+ADD OK\r\n".to_string())
-        },
-        ["get", key] => Some(db.get(*key)
-                                .cloned()
-                                .unwrap_or_else(|| "$-1\r\n".into())),
-        _ => Some("-ERR unKnown command\r\n".to_string()),
-    }
+    Ok(())
 }
