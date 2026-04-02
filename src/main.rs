@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io::{BufRead, BufReader, Write}, net::{TcpListener, TcpStream}};
 
+#[derive(Debug)]
 enum Command {
     Set(String, String),
     Get(String),
@@ -122,5 +123,228 @@ mod tests {
     fn test_parse_exists() {
         let cmd = Command::from_str("exists key").unwrap();
         matches!(cmd, Command::Exists(_));
+    }
+
+    #[test]
+    fn test_parse_unknown_command() {
+        let result = Command::from_str("unknown key");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "unknown command");
+    }
+
+    #[test]
+    fn test_execute_set() {
+        let mut db = HashMap::new();
+        let cmd = Command::Set("name".to_string(), "rust".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, "+OK\r\n");
+        assert_eq!(db.get("name").unwrap(), "rust");
+    }
+
+    #[test]
+    fn test_execute_set_overwrite() {
+        let mut db = HashMap::new();
+        db.insert("name".to_string(), "old".to_string());
+        
+        let cmd = Command::Set("name".to_string(), "new".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, "+OK\r\n");
+        assert_eq!(db.get("name").unwrap(), "new");
+    }
+
+    #[test]
+    fn test_execute_set_multiple_keys() {
+        let mut db = HashMap::new();
+        
+        Command::Set("key1".to_string(), "value1".to_string()).execute(&mut db);
+        Command::Set("key2".to_string(), "value2".to_string()).execute(&mut db);
+        Command::Set("key3".to_string(), "value3".to_string()).execute(&mut db);
+        
+        assert_eq!(db.len(), 3);
+        assert_eq!(db.get("key1").unwrap(), "value1");
+        assert_eq!(db.get("key2").unwrap(), "value2");
+        assert_eq!(db.get("key3").unwrap(), "value3");
+    }
+
+    #[test]
+    fn test_execute_get_exist() {
+        let mut db = HashMap::new();
+        db.insert("name".to_string(), "rust".to_string());
+        
+        let cmd = Command::Get("name".to_string());
+        let response = cmd.execute(&mut db);
+        
+        // RESP 格式：$len\r\nvalue\r\n
+        assert_eq!(response, "$4\r\nrust\r\n");
+    }
+
+    #[test]
+    fn test_execute_get_not_found() {
+        let mut db = HashMap::new();
+        let cmd = Command::Get("notfound".to_string());
+        let response = cmd.execute(&mut db);
+        
+        // RESP 格式：$-1\r\n（表示 nil）
+        assert_eq!(response, "$-1\r\n");
+    }
+
+    #[test]
+    fn test_execute_get_empty_value() {
+        let mut db = HashMap::new();
+        db.insert("empty".to_string(), "".to_string());
+        
+        let cmd = Command::Get("empty".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, "$0\r\n\r\n");
+    }
+
+    #[test]
+    fn test_execute_get_after_set() {
+        let mut db = HashMap::new();
+        
+        Command::Set("key".to_string(), "value".to_string()).execute(&mut db);
+        let response = Command::Get("key".to_string()).execute(&mut db);
+        
+        assert_eq!(response, "$5\r\nvalue\r\n");
+    }
+
+    #[test]
+    fn test_execute_del_exist() {
+        let mut db = HashMap::new();
+        db.insert("name".to_string(), "rust".to_string());
+        
+        let cmd = Command::Del("name".to_string());
+        let response = cmd.execute(&mut db);
+        
+        // RESP 格式：:1\r\n（删除成功）
+        assert_eq!(response, ":1\r\n");
+        assert!(!db.contains_key("name"));
+    }
+
+    #[test]
+    fn test_execute_del_not_found() {
+        let mut db = HashMap::new();
+        let cmd = Command::Del("notfound".to_string());
+        let response = cmd.execute(&mut db);
+        
+        // RESP 格式：:0\r\n（不存在或删除失败）
+        assert_eq!(response, ":0\r\n");
+    }
+
+    #[test]
+    fn test_execute_del_multiple() {
+        let mut db = HashMap::new();
+        db.insert("key1".to_string(), "value1".to_string());
+        db.insert("key2".to_string(), "value2".to_string());
+        db.insert("key3".to_string(), "value3".to_string());
+        
+        Command::Del("key1".to_string()).execute(&mut db);
+        let response = Command::Del("key2".to_string()).execute(&mut db);
+        
+        assert_eq!(response, ":1\r\n");
+        assert_eq!(db.len(), 1);
+        assert!(db.contains_key("key3"));
+    }
+
+    #[test]
+    fn test_execute_del_same_key_twice() {
+        let mut db = HashMap::new();
+        db.insert("name".to_string(), "rust".to_string());
+        
+        let response1 = Command::Del("name".to_string()).execute(&mut db);
+        let response2 = Command::Del("name".to_string()).execute(&mut db);
+        
+        assert_eq!(response1, ":1\r\n");  // 第一次删除成功
+        assert_eq!(response2, ":0\r\n");  // 第二次不存在
+    }
+
+    #[test]
+    fn test_execute_exists_true() {
+        let mut db = HashMap::new();
+        db.insert("name".to_string(), "rust".to_string());
+        
+        let cmd = Command::Exists("name".to_string());
+        let response = cmd.execute(&mut db);
+        
+        // RESP 格式：:1\r\n（存在）
+        assert_eq!(response, ":1\r\n");
+    }
+
+    #[test]
+    fn test_execute_exists_false() {
+        let mut db = HashMap::new();
+        let cmd = Command::Exists("notfound".to_string());
+        let response = cmd.execute(&mut db);
+        
+        // RESP 格式：:0\r\n（不存在）
+        assert_eq!(response, ":0\r\n");
+    }
+
+    #[test]
+    fn test_execute_exists_after_set() {
+        let mut db = HashMap::new();
+        
+        Command::Set("key".to_string(), "value".to_string()).execute(&mut db);
+        let response = Command::Exists("key".to_string()).execute(&mut db);
+        
+        assert_eq!(response, ":1\r\n");
+    }
+
+    #[test]
+    fn test_execute_exists_after_del() {
+        let mut db = HashMap::new();
+        db.insert("key".to_string(), "value".to_string());
+        
+        Command::Del("key".to_string()).execute(&mut db);
+        let response = Command::Exists("key".to_string()).execute(&mut db);
+        
+        assert_eq!(response, ":0\r\n");
+    }
+
+    #[test]
+    fn test_execute_exists_multiple_keys() {
+        let mut db = HashMap::new();
+        db.insert("key1".to_string(), "value1".to_string());
+        db.insert("key2".to_string(), "value2".to_string());
+        
+        let exists_key1 = Command::Exists("key1".to_string()).execute(&mut db);
+        let exists_key2 = Command::Exists("key2".to_string()).execute(&mut db);
+        let exists_key3 = Command::Exists("key3".to_string()).execute(&mut db);
+        
+        assert_eq!(exists_key1, ":1\r\n");
+        assert_eq!(exists_key2, ":1\r\n");
+        assert_eq!(exists_key3, ":0\r\n");
+    }
+
+    #[test]
+    fn test_workflow() {
+        let mut db = HashMap::new();
+        
+        // 1. SET
+        let resp1 = Command::Set("user".to_string(), "alice".to_string()).execute(&mut db);
+        assert_eq!(resp1, "+OK\r\n");
+        
+        // 2. EXISTS
+        let resp2 = Command::Exists("user".to_string()).execute(&mut db);
+        assert_eq!(resp2, ":1\r\n");
+        
+        // 3. GET
+        let resp3 = Command::Get("user".to_string()).execute(&mut db);
+        assert_eq!(resp3, "$5\r\nalice\r\n");
+        
+        // 4. DEL
+        let resp4 = Command::Del("user".to_string()).execute(&mut db);
+        assert_eq!(resp4, ":1\r\n");
+        
+        // 5. EXISTS after DEL
+        let resp5 = Command::Exists("user".to_string()).execute(&mut db);
+        assert_eq!(resp5, ":0\r\n");
+        
+        // 6. GET after DEL
+        let resp6 = Command::Get("user".to_string()).execute(&mut db);
+        assert_eq!(resp6, "$-1\r\n");
     }
 }
