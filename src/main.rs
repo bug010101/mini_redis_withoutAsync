@@ -3,8 +3,8 @@ use std::{collections::HashMap, io::{BufRead, BufReader, Write}, net::{TcpListen
 enum Command {
     Set(String, String),
     Get(String),
-    // Del(String),
-    // Exists(String),
+    Del(String),
+    Exists(String),
 }
 
 impl Command {
@@ -16,6 +16,8 @@ impl Command {
         match parts.as_slice() {
             ["set", key, value] => Ok(Command::Set(key.to_string(), value.to_string())),
             ["get", key] => Ok(Command::Get(key.to_string())),
+            ["del", key] => Ok(Command::Del(key.to_string())),
+            ["exists", key] => Ok(Command::Exists(key.to_string())),
             _ => Err("unknown command".to_string()),
         }
     }
@@ -35,7 +37,21 @@ impl Command {
                     Some(v) => format!("${}\r\n{}\r\n", v.len(), v),
                     None => "$-1\r\n".to_string(),
                 }
-            }
+            },
+            Command::Del(key) => {
+                if db.remove(key).is_some() {
+                    ":1\r\n".to_string()
+                } else {
+                    ":0\r\n".to_string()
+                }
+            },
+            Command::Exists(key) => {
+                if db.contains_key(key) {
+                    ":1\r\n".to_string()
+                } else {
+                    ":0\r\n".to_string()
+                }
+            },
         }
     }
 }
@@ -88,5 +104,23 @@ mod tests {
     fn test_parse_set() {
         let cmd = Command::from_str("set key value").unwrap();
         matches!(cmd, Command::Set(_, _));
+    }
+
+    #[test]
+    fn test_parse_get() {
+        let cmd = Command::from_str("get key").unwrap();
+        matches!(cmd, Command::Get(_));
+    }
+
+    #[test]
+    fn test_parse_del() {
+        let cmd = Command::from_str("del key").unwrap();
+        matches!(cmd, Command::Del(_));
+    }
+
+    #[test]
+    fn test_parse_exists() {
+        let cmd = Command::from_str("exists key").unwrap();
+        matches!(cmd, Command::Exists(_));
     }
 }
