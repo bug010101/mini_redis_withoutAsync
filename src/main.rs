@@ -6,6 +6,10 @@ enum Command {
     Get(String),
     Del(String),
     Exists(String),
+    Incr(String),
+    Decr(String),
+    Incrby(String, String),
+    Decrby(String, String),
 }
 
 impl Command {
@@ -19,6 +23,10 @@ impl Command {
             ["get", key] => Ok(Command::Get(key.to_string())),
             ["del", key] => Ok(Command::Del(key.to_string())),
             ["exists", key] => Ok(Command::Exists(key.to_string())),
+            ["incr", key] => Ok(Command::Incr(key.to_string())),
+            ["decr", key] => Ok(Command::Decr(key.to_string())),
+            ["incrby", key, value] => Ok(Command::Incrby(key.to_string(), value.to_string())),
+            ["decrby", key, value] => Ok(Command::Decrby(key.to_string(), value.to_string())),
             _ => Err("unknown command".to_string()),
         }
     }
@@ -53,7 +61,38 @@ impl Command {
                     ":0\r\n".to_string()
                 }
             },
+            Command::Incr(key) => {
+                Command::execute_number(db, key, 1)
+            }
+            Command::Decr(key) => {
+                Command::execute_number(db, key, -1)
+            }
+            Command::Incrby(key, increment) => {
+                match increment.parse::<i64>() {
+                    Ok(value) => {
+                        Command::execute_number(db, key, value)
+                    },
+                    Err(_) => format!("-ERR value is not an integer or out of range\r\n"),
+                }
+            },
+            Command::Decrby(key, decrement ) => {
+                match decrement.parse::<i64>() {
+                    Ok(value) => {
+                        Command::execute_number(db, key, -value)
+                    },
+                    Err(_) => format!("-ERR value is not an integer or out of range\r\n"),
+                }
+            }
         }
+    }
+
+    fn execute_number(db: &mut HashMap<String, String>, key: &String, increment: i64) -> String {
+        let current = db.get(key)
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0);
+        let next_value = current + increment;
+        db.insert(key.to_string(), next_value.to_string());
+        format!(":{}\r\n", next_value)
     }
 }
 
