@@ -11,6 +11,9 @@
 - decr key - key(i64) - 1
 - incrby key value - key(i64) + value
 - decrby key value - key(i64) - value
+- append key value - db[key]后面连接value
+- strlen key - 获取长度
+- getrange key 1 5 - 获取区间长度
 ## 编译运行
 ```bash
 cargo run
@@ -23,13 +26,16 @@ cargo test
 
 ## 测试
 ```
-> nc localhost:6379 \
-> set key 1 \
-> get key \
-> del key \
-> exists key \
-> incr key \
-> decr key \
-> incrby key 5
-> decrby key 5
+> nc localhost:6379 
+> set key 1 
+> get key 
+> del key 
+> exists key 
+> incr key 
+> decr key 
+> incrby key 5 
+> decrby key 5 
+> append key hello 
+> strlen key 
+> getrange key 1 5 
 ```

@@ -10,6 +10,9 @@ enum Command {
     Decr(String),
     Incrby(String, String),
     Decrby(String, String),
+    Append(String, String),
+    Strlen(String),
+    Getrange(String, String, String),
 }
 
 impl Command {
@@ -27,6 +30,9 @@ impl Command {
             ["decr", key] => Ok(Command::Decr(key.to_string())),
             ["incrby", key, value] => Ok(Command::Incrby(key.to_string(), value.to_string())),
             ["decrby", key, value] => Ok(Command::Decrby(key.to_string(), value.to_string())),
+            ["append", key, value] => Ok(Command::Append(key.to_string(), value.to_string())),
+            ["strlen", key] => Ok(Command::Strlen(key.to_string())),
+            ["getrange", key, start, end] => Ok(Command::Getrange(key.to_string(), start.to_string(), end.to_string())),
             _ => Err("unknown command".to_string()),
         }
     }
@@ -82,7 +88,45 @@ impl Command {
                     },
                     Err(_) => format!("-ERR value is not an integer or out of range\r\n"),
                 }
-            }
+            },
+            Command::Append(key, value) => {
+                let current = db.get(key).cloned().unwrap_or_default();
+                let next_value = format!("{}{}", current, value);
+                let len = next_value.len();
+                db.insert(key.to_string(), next_value);
+                format!(":{}\r\n", len)
+            },
+            Command::Strlen(key) => {
+                match db.get(key) {
+                    Some(v) => format!(":{}\r\n", v.len()),
+                    None => format!(":0\r\n")
+                }
+            },
+            Command::Getrange(key, start, end) => {
+                match (start.parse::<usize>(), end.parse::<usize>()) {
+                    (Ok(start_idx), Ok(end_idx)) => {
+                        match db.get(key) {
+                            Some(v) => {
+                                let bytes = v.as_bytes();
+                                let len = bytes.len();
+                                
+                                // 处理负数索引
+                                let start_idx = if start_idx > len { len } else { start_idx };
+                                let end_idx = if end_idx >= len { len - 1 } else { end_idx };
+                                
+                                if start_idx > end_idx {
+                                    "$0\r\n\r\n".to_string()
+                                } else {
+                                    let substring = String::from_utf8_lossy(&bytes[start_idx..=end_idx]);
+                                    format!("${}\r\n{}\r\n", substring.len(), substring)
+                                }
+                            },
+                            None => "$-1\r\n".to_string(),
+                        }
+                    },
+                    _ => format!("-ERR value is not an integer or out of range\r\n"),
+                }
+            },
         }
     }
 
@@ -359,31 +403,217 @@ mod tests {
     }
 
     #[test]
-    fn test_workflow() {
+    fn test_execute_append_new_key() {
+        let mut db = HashMap::new();
+        let cmd = Command::Append("message".to_string(), "hello".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, ":5\r\n");
+        assert_eq!(db.get("message").unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_execute_append_existing() {
+        let mut db = HashMap::new();
+        db.insert("message".to_string(), "hello".to_string());
+        
+        let cmd = Command::Append("message".to_string(), " world".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, ":11\r\n");
+        assert_eq!(db.get("message").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_execute_append_multiple_times() {
+        let mut db = HashMap::new();
+        
+        Command::Append("str".to_string(), "a".to_string()).execute(&mut db);
+        Command::Append("str".to_string(), "b".to_string()).execute(&mut db);
+        let response = Command::Append("str".to_string(), "c".to_string()).execute(&mut db);
+        
+        assert_eq!(response, ":3\r\n");
+        assert_eq!(db.get("str").unwrap(), "abc");
+    }
+
+    #[test]
+    fn test_execute_append_empty_string() {
+        let mut db = HashMap::new();
+        db.insert("message".to_string(), "hello".to_string());
+        
+        let cmd = Command::Append("message".to_string(), "".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, ":5\r\n");
+        assert_eq!(db.get("message").unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_execute_strlen_exist() {
+        let mut db = HashMap::new();
+        db.insert("message".to_string(), "hello".to_string());
+        
+        let cmd = Command::Strlen("message".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, ":5\r\n");
+    }
+
+    #[test]
+    fn test_execute_strlen_not_found() {
+        let mut db = HashMap::new();
+        let cmd = Command::Strlen("notfound".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, ":0\r\n");
+    }
+
+    #[test]
+    fn test_execute_strlen_empty_string() {
+        let mut db = HashMap::new();
+        db.insert("empty".to_string(), "".to_string());
+        
+        let cmd = Command::Strlen("empty".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, ":0\r\n");
+    }
+
+    #[test]
+    fn test_execute_strlen_long_string() {
+        let mut db = HashMap::new();
+        db.insert("long".to_string(), "this is a very long string".to_string());
+        
+        let cmd = Command::Strlen("long".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, ":26\r\n");
+    }
+
+    #[test]
+    fn test_execute_getrange_basic() {
+        let mut db = HashMap::new();
+        db.insert("message".to_string(), "hello world".to_string());
+        
+        let cmd = Command::Getrange("message".to_string(), "0".to_string(), "4".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, "$5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn test_execute_getrange_middle() {
+        let mut db = HashMap::new();
+        db.insert("message".to_string(), "hello world".to_string());
+        
+        let cmd = Command::Getrange("message".to_string(), "6".to_string(), "10".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, "$5\r\nworld\r\n");
+    }
+
+    #[test]
+    fn test_execute_getrange_single_char() {
+        let mut db = HashMap::new();
+        db.insert("message".to_string(), "hello".to_string());
+        
+        let cmd = Command::Getrange("message".to_string(), "0".to_string(), "0".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, "$1\r\nh\r\n");
+    }
+
+    #[test]
+    fn test_execute_getrange_out_of_range() {
+        let mut db = HashMap::new();
+        db.insert("message".to_string(), "hello".to_string());
+        
+        let cmd = Command::Getrange("message".to_string(), "10".to_string(), "20".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, "$0\r\n\r\n");
+    }
+
+    #[test]
+    fn test_execute_getrange_not_found() {
+        let mut db = HashMap::new();
+        let cmd = Command::Getrange("notfound".to_string(), "0".to_string(), "5".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert_eq!(response, "$-1\r\n");
+    }
+
+    #[test]
+    fn test_execute_getrange_invalid_index() {
+        let mut db = HashMap::new();
+        db.insert("message".to_string(), "hello".to_string());
+        
+        let cmd = Command::Getrange("message".to_string(), "abc".to_string(), "def".to_string());
+        let response = cmd.execute(&mut db);
+        
+        assert!(response.contains("ERR"));
+    }
+
+    #[test]
+    fn test_workflow_string_operations() {
         let mut db = HashMap::new();
         
         // 1. SET
-        let resp1 = Command::Set("user".to_string(), "alice".to_string()).execute(&mut db);
+        let resp1 = Command::Set("greeting".to_string(), "hello".to_string()).execute(&mut db);
         assert_eq!(resp1, "+OK\r\n");
         
-        // 2. EXISTS
-        let resp2 = Command::Exists("user".to_string()).execute(&mut db);
-        assert_eq!(resp2, ":1\r\n");
+        // 2. STRLEN
+        let resp2 = Command::Strlen("greeting".to_string()).execute(&mut db);
+        assert_eq!(resp2, ":5\r\n");
         
-        // 3. GET
-        let resp3 = Command::Get("user".to_string()).execute(&mut db);
-        assert_eq!(resp3, "$5\r\nalice\r\n");
+        // 3. APPEND
+        let resp3 = Command::Append("greeting".to_string(), " world".to_string()).execute(&mut db);
+        assert_eq!(resp3, ":11\r\n");
         
-        // 4. DEL
-        let resp4 = Command::Del("user".to_string()).execute(&mut db);
-        assert_eq!(resp4, ":1\r\n");
+        // 4. STRLEN after APPEND
+        let resp4 = Command::Strlen("greeting".to_string()).execute(&mut db);
+        assert_eq!(resp4, ":11\r\n");
         
-        // 5. EXISTS after DEL
-        let resp5 = Command::Exists("user".to_string()).execute(&mut db);
-        assert_eq!(resp5, ":0\r\n");
+        // 5. GET
+        let resp5 = Command::Get("greeting".to_string()).execute(&mut db);
+        assert_eq!(resp5, "$11\r\nhello world\r\n");
         
-        // 6. GET after DEL
-        let resp6 = Command::Get("user".to_string()).execute(&mut db);
-        assert_eq!(resp6, "$-1\r\n");
+        // 6. GETRANGE
+        let resp6 = Command::Getrange("greeting".to_string(), "0".to_string(), "4".to_string()).execute(&mut db);
+        assert_eq!(resp6, "$5\r\nhello\r\n");
+        
+        // 7. GETRANGE middle
+        let resp7 = Command::Getrange("greeting".to_string(), "6".to_string(), "10".to_string()).execute(&mut db);
+        assert_eq!(resp7, "$5\r\nworld\r\n");
+    }
+
+    #[test]
+    fn test_workflow_complete_all_commands() {
+        let mut db = HashMap::new();
+        
+        // String operations
+        Command::Set("msg".to_string(), "hello".to_string()).execute(&mut db);
+        Command::Append("msg".to_string(), " rust".to_string()).execute(&mut db);
+        
+        // Numeric operations
+        Command::Incr("counter".to_string()).execute(&mut db);
+        Command::Incrby("counter".to_string(), "4".to_string()).execute(&mut db);
+        
+        // Key operations
+        let exists = Command::Exists("counter".to_string()).execute(&mut db);
+        assert_eq!(exists, ":1\r\n");
+        
+        let strlen = Command::Strlen("msg".to_string()).execute(&mut db);
+        assert_eq!(strlen, ":10\r\n");
+        
+        let getrange = Command::Getrange("msg".to_string(), "0".to_string(), "4".to_string()).execute(&mut db);
+        assert_eq!(getrange, "$5\r\nhello\r\n");
+        
+        // Delete
+        let del = Command::Del("msg".to_string()).execute(&mut db);
+        assert_eq!(del, ":1\r\n");
+        
+        let exists_after = Command::Exists("msg".to_string()).execute(&mut db);
+        assert_eq!(exists_after, ":0\r\n");
     }
 }
