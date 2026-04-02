@@ -5,4 +5,12 @@ edition = "2021"
 description = "A simple Redis implementation in Rust (synchronous)"
 authors = ["bug010101"]
 
+[lib]
+name = "mini_redis"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mini_redis"
+path = "src/main.rs"
+
 [dependencies]

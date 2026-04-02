@@ -14,6 +14,13 @@
 - append key value - db[key]后面连接value
 - strlen key - 获取长度
 - getrange key 1 5 - 获取区间长度
+
+## 编译
+
+```bash
+cargo build --release
+```
+
 ## 编译运行
 ```bash
 cargo run
