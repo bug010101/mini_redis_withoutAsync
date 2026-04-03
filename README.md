@@ -1,6 +1,6 @@
 # Mini Redis
 
-一个用 Rust 实现的简单 Redis 服务器（同步版本）
+一个用 Rust 实现的简单 Redis 服务器（异步版本）
 
 ## 功能
 - set key value - 设置键值对
@@ -14,7 +14,7 @@
 - append key value - db[key]后面连接value
 - strlen key - 获取长度
 - getrange key 1 5 - 获取区间长度
-
+- info - 获取当前的状态信息
 ## 编译
 
 ```bash
@@ -45,4 +45,5 @@ cargo test
 > append key hello 
 > strlen key 
 > getrange key 1 5 
+> info 
 ```

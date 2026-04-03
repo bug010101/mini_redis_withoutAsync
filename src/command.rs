@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use crate::db::{BaseDb, Db};
 
 #[derive(Debug)]
 pub enum Command {
@@ -13,6 +13,8 @@ pub enum Command {
     Append(String, String),
     Strlen(String),
     Getrange(String, String, String),
+    Info,
+    Exit,
 }
 
 impl Command {
@@ -33,6 +35,8 @@ impl Command {
             ["append", key, value] => Ok(Command::Append(key.to_string(), value.to_string())),
             ["strlen", key] => Ok(Command::Strlen(key.to_string())),
             ["getrange", key, start, end] => Ok(Command::Getrange(key.to_string(), start.to_string(), end.to_string())),
+            ["info"] => Ok(Command::Info),
+            ["exit"] => Ok(Command::Exit),
             _ => Err("unknown command".to_string()),
         }
     }
@@ -41,42 +45,50 @@ impl Command {
     /// 1、匹配枚举类型
     /// 2、执行对应的数据库操作
     /// 3、返回String类型
-    pub fn execute(&self, db: &mut HashMap<String, String>) -> String {
+    pub async fn execute(&self, db: &Db) -> String {
         match self {
             Command::Set(key, value) => {
-                db.insert(key.clone(), value.clone());
-                "+OK\r\n".to_string()
+                Self::write_operation(db, |db_write| {
+                    db_write.insert(key.to_string(), value.to_string());
+                    "+OK\r\n".to_string()
+                }).await
             },
             Command::Get(key) => {
-                match db.get(key) {
-                    Some(v) => format!("${}\r\n{}\r\n", v.len(), v),
-                    None => "$-1\r\n".to_string(),
-                }
+                Self::read_operation(db, |db_read| {
+                    match db_read.get(key) {
+                        Some(v) => format!("${}\r\n{}\r\n", v.len(), v),
+                        None => "$-1\r\n".to_string(),
+                    }
+                }).await
             },
             Command::Del(key) => {
-                if db.remove(key).is_some() {
-                    ":1\r\n".to_string()
-                } else {
-                    ":0\r\n".to_string()
-                }
+                Self::write_operation(db, |db_del| {
+                    if db_del.remove(key).is_some() {
+                        ":1\r\n".to_string()
+                    } else {
+                        ":0\r\n".to_string()
+                    }
+                }).await
             },
             Command::Exists(key) => {
-                if db.contains_key(key) {
-                    ":1\r\n".to_string()
-                } else {
-                    ":0\r\n".to_string()
-                }
+                Self::read_operation(db, |db_exists| {
+                    if db_exists.contains_key(key) {
+                        ":1\r\n".to_string()
+                    } else {
+                        ":0\r\n".to_string()
+                    }
+                }).await
             },
             Command::Incr(key) => {
-                Command::execute_number(db, key, 1)
+                Command::execute_number(db, key, 1).await
             }
             Command::Decr(key) => {
-                Command::execute_number(db, key, -1)
+                Command::execute_number(db, key, -1).await
             }
             Command::Incrby(key, increment) => {
                 match increment.parse::<i64>() {
                     Ok(value) => {
-                        Command::execute_number(db, key, value)
+                        Command::execute_number(db, key, value).await
                     },
                     Err(_) => format!("-ERR value is not an integer or out of range\r\n"),
                 }
@@ -84,58 +96,98 @@ impl Command {
             Command::Decrby(key, decrement ) => {
                 match decrement.parse::<i64>() {
                     Ok(value) => {
-                        Command::execute_number(db, key, -value)
+                        Command::execute_number(db, key, -value).await
                     },
                     Err(_) => format!("-ERR value is not an integer or out of range\r\n"),
                 }
             },
             Command::Append(key, value) => {
-                let current = db.get(key).cloned().unwrap_or_default();
-                let next_value = format!("{}{}", current, value);
-                let len = next_value.len();
-                db.insert(key.to_string(), next_value);
-                format!(":{}\r\n", len)
+                Self::write_operation(db, |db_write| {
+                    // let current = db_write.get(key).cloned().unwrap_or_default();
+                    // let next_value = format!("{}{}", current, value);
+                    let s = db_write.entry(key.clone()).or_insert_with(String::new);
+                    s.push_str(value);
+                    let len = s.len();
+                    format!(":{}\r\n", len)
+                }).await
             },
             Command::Strlen(key) => {
-                match db.get(key) {
-                    Some(v) => format!(":{}\r\n", v.len()),
-                    None => format!(":0\r\n")
-                }
+                Self::read_operation(db, |db_read| {
+                    match db_read.get(key) {
+                        Some(v) => format!(":{}\r\n", v.len()),
+                        None => format!(":0\r\n")
+                    }
+                }).await
             },
             Command::Getrange(key, start, end) => {
-                match (start.parse::<usize>(), end.parse::<usize>()) {
-                    (Ok(start_idx), Ok(end_idx)) => {
-                        match db.get(key) {
-                            Some(v) => {
-                                let bytes = v.as_bytes();
-                                let len = bytes.len();
-                                
-                                // 处理负数索引
-                                let start_idx = if start_idx > len { len } else { start_idx };
-                                let end_idx = if end_idx >= len { len - 1 } else { end_idx };
-                                
-                                if start_idx > end_idx {
-                                    "$0\r\n\r\n".to_string()
-                                } else {
-                                    let substring = String::from_utf8_lossy(&bytes[start_idx..=end_idx]);
-                                    format!("${}\r\n{}\r\n", substring.len(), substring)
-                                }
-                            },
-                            None => "$-1\r\n".to_string(),
-                        }
-                    },
-                    _ => format!("-ERR value is not an integer or out of range\r\n"),
-                }
+                Self::read_operation(db, |db_read| {
+                    match (start.parse::<usize>(), end.parse::<usize>()) {
+                        (Ok(start_idx), Ok(end_idx)) => {
+                            match db_read.get(key) {
+                                Some(v) => {
+                                    let bytes = v.as_bytes();
+                                    let len = bytes.len();
+                                    // 处理负数索引
+                                    let start_idx = if start_idx > len { len } else { start_idx };
+                                    let end_idx = if end_idx >= len { len - 1 } else { end_idx };
+                                    if start_idx > end_idx {
+                                        "$0\r\n\r\n".to_string()
+                                    } else {
+                                        let substring = String::from_utf8_lossy(&bytes[start_idx..=end_idx]);
+                                        format!("${}\r\n{}\r\n", substring.len(), substring)
+                                    }
+                                },
+                                None => "$-1\r\n".to_string(),
+                            }
+                        },
+                        _ => format!("-ERR value is not an integer or out of range\r\n"),
+                    }
+                }).await
             },
+            Command::Info => {
+                // 不用闭包，用守卫操作
+                let read_guard = db.read().await;
+                let info_content = format!(
+                    "# Server\r\n\
+                    version:0.1.0\r\n\
+                    os:{}\r\n\
+                    # Keyspace\r\n\
+                    db0:keys={},expires=0\r\n",
+                    std::env::consts::OS, 
+                    read_guard.len()
+                );
+                format!("${}\r\n{}\r\n", info_content.len(), info_content)
+            },
+            Command::Exit => {
+                "+Ok\r\n".to_string()
+            }
         }
     }
 
-    fn execute_number(db: &mut HashMap<String, String>, key: &String, increment: i64) -> String {
-        let current = db.get(key)
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(0);
-        let next_value = current + increment;
-        db.insert(key.to_string(), next_value.to_string());
-        format!(":{}\r\n", next_value)
+    async fn execute_number(db: &Db, key: &String, increment: i64) -> String {
+        Self::write_operation(db, |db_map| {
+            let current = db_map.get(key)
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(0);
+            let next_value = current + increment;
+            db_map.insert(key.to_string(), next_value.to_string());
+            format!(":{}\r\n", next_value)
+        }).await
+    }
+
+    async fn read_operation<F, T>(db: &Db, f: F) -> T
+    where 
+        F: FnOnce(&BaseDb) -> T
+    {
+        let guard = db.read().await;
+        f(&*guard)
+    }
+
+    async fn write_operation<F, T>(db: &Db, f: F) -> T
+    where 
+        F: FnOnce(&mut BaseDb) -> T
+    {
+        let mut guard = db.write().await;
+        f(&mut *guard)
     }
 }

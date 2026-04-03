@@ -14,3 +14,4 @@ name = "mini_redis"
 path = "src/main.rs"
 
 [dependencies]
+tokio = {version = "1", features = ["full"]}
