@@ -46,7 +46,13 @@ pub async fn run_server() -> tokio::io::Result<()>{
     println!("Server running on 0.0.0.0:6379");
 
     loop {
-        let (stream, socket_addr) = listener.accept().await?;
+        let (stream, socket_addr) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Accept failed: {}", e);
+                continue; // 继续接受下一个连接
+            }
+        };
         println!("socket_addr in on {:?}", socket_addr);
         let db_clone = Arc::clone(&db);
         

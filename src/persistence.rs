@@ -36,7 +36,7 @@ impl PersistenceConfigBuilder {
         self.rdb_path = path.to_string();
         self
     }
-
+    
     fn save_interval_secs(mut self, secs: u64) -> Self {
         self.save_interval_secs = secs;
         self
