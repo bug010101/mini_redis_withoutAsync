@@ -24,7 +24,7 @@ struct PersistenceConfigBuilder {
 }
 
 impl PersistenceConfigBuilder {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             rdb_path: "dump.rdb".to_string(),
             save_interval_secs: 60,
@@ -32,22 +32,22 @@ impl PersistenceConfigBuilder {
         }
     }
 
-    fn rdb_path(mut self, path: &str) -> Self {
+    pub fn rdb_path(mut self, path: &str) -> Self {
         self.rdb_path = path.to_string();
         self
     }
     
-    fn save_interval_secs(mut self, secs: u64) -> Self {
+    pub fn save_interval_secs(mut self, secs: u64) -> Self {
         self.save_interval_secs = secs;
         self
     }
 
-    fn save_min_changes(mut self, changes: u64) -> Self {
+    pub fn save_min_changes(mut self, changes: u64) -> Self {
         self.save_min_changes = changes;
         self
     }
     #[must_use]
-    fn build(self) -> PersistenceConfig {
+    pub fn build(self) -> PersistenceConfig {
         PersistenceConfig {
             rdb_path: self.rdb_path,
             save_interval_secs: self.save_interval_secs,

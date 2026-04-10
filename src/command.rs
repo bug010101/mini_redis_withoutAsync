@@ -118,7 +118,7 @@ impl Command {
                 Self::read_operation(db, |db_read| {
                     match db_read.get(key) {
                         Some(v) => (format!(":{}\r\n", v.len()), false),
-                        None => (format!(":0\r\n"), true)
+                        None => (format!(":0\r\n"), false)
                     }
                 }).await
             },
