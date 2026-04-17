@@ -2,6 +2,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tokio::sync::RwLock;
 use crate::command::Command;
 use crate::db::Db;
@@ -19,7 +20,7 @@ pub async fn run_server() -> tokio::io::Result<()>{
     // 启动定时持久化任务
     let db_clone = Arc::clone(&db);
     let config_clone = config.clone();
-    let save_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(config_clone.save_interval_secs));
         loop {
             interval.tick().await;
@@ -32,10 +33,34 @@ pub async fn run_server() -> tokio::io::Result<()>{
             }
         }
     });
+
+    // 启动过期清理任务
+    let db_cleanup = Arc::clone(&db);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            // 获取数据库操作的守卫
+            let mut db_write = db_cleanup.write().await; 
+            let now = Instant::now();
+            let before_len = db_write.len();
+            // 保留未过期的数据
+            db_write.retain(|_, entry| {
+                entry.expires_at.map_or(true, |at| at > now)
+            });
+            let deleted = before_len - db_write.len();
+            if deleted > 0 {
+                // 如果删除了过期key，增加全局写操作计数，触发后续RDB保存
+                DIRTY_COUNT.fetch_add(deleted as u64, Ordering::Relaxed);
+                println!("Deleted {} expired keys", deleted);
+            }
+        }
+    });
+
     // 监听关闭信号，优雅退出
     let db_shutdown = Arc::clone(&db);
     let rdb_path = config.rdb_path.clone();
-    let shutdown_handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         println!("\nShutting down, saving final snapshot...");
         persistence::save_to_rdb(&db_shutdown, &rdb_path).await.ok();
