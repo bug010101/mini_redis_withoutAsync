@@ -1,9 +1,10 @@
-use std::time::{Duration, Instant};
+use std::{collections::{HashMap, HashSet, VecDeque}, time::{Duration, Instant}};
 
-use crate::{db::{BaseDb, Db, Entry}, protocol::Frame};
+use crate::{db::{BaseDb, Db, Entry, RedisValue}, protocol::Frame};
 
 #[derive(Debug)]
 pub enum Command {
+    // RedisValue::String类型的枚举
     Set(String, String, Option<u64>), // 增加可选的秒数
     Get(String),
     Del(String),
@@ -15,6 +16,22 @@ pub enum Command {
     Append(String, String),
     Strlen(String),
     Getrange(String, String, String),
+
+    // RedisValue::List类型的枚举
+    LPUSH(String, Vec<String>), // 左边推入
+    LPOP(String), // 左边弹出
+    LRANGE(String, i64, i64), // 左数start到end
+
+    // RedisValue::Hash类型的枚举
+    HSet(String, String, String), // 设置字段: key, 字段， 值
+    HGet(String, String), // 获取字段的值: key, 字段
+    HGetAll(String), // 获取所有字段的值: key
+
+    // RedisValue::Set类型的枚举
+    SAdd(String, Vec<String>), // 添加元素: key, 元素集合
+    SRem(String, Vec<String>), // 移除元素: key, 元素集合
+    SMembers(String), // 获取元素: key
+    // 通用类型的枚举
     Info,
     Exit,
     Ping,
@@ -40,6 +57,7 @@ impl Command {
         let args = &parts[1..];
 
         match (command_name.as_str(), args) {
+            // String类型的枚举
             ("set", [key, value]) => Ok(Command::Set(key.clone(), value.clone(), None)),
             ("set", [key, value, ex, secs]) if ex.to_lowercase() == "ex" => {
                 let s = secs.parse::<u64>().map_err(|_| "invalid expire time")?;
@@ -55,6 +73,34 @@ impl Command {
             ("append", [key, val]) => Ok(Command::Append(key.clone(), val.clone())),
             ("strlen", [key]) => Ok(Command::Strlen(key.clone())),
             ("getrange", [key, start, end]) => Ok(Command::Getrange(key.clone(), start.clone(), end.clone())),
+            // List类型的枚举
+            ("lpush", [key, rest @ ..]) => {
+                let values = rest.iter().cloned().collect();
+                Ok(Command::LPUSH(key.clone(), values))
+            },
+            ("lpop", [key]) => Ok(Command::LPOP(key.clone())),
+            ("lrange", [key, start, end]) => {
+                let start = start.parse::<i64>()
+                    .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+                let end = end.parse::<i64>()
+                    .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+                Ok(Command::LRANGE(key.clone(), start, end))
+            },
+            // Hash类型的枚举
+            ("hset", [key, field, val]) => Ok(Command::HSet(key.clone(), field.clone(), val.clone())),
+            ("hget", [key, field]) => Ok(Command::HGet(key.clone(), field.clone())),
+            ("hgetall", [key]) => Ok(Command::HGetAll(key.clone())),
+            // Set类型的枚举
+            ("sadd", [key, rest @ ..]) => {
+                let members = rest.iter().cloned().collect();
+                Ok(Command::SAdd(key.clone(), members))
+            },
+            ("srem", [key, rest @ ..]) => {
+                let members = rest.iter().cloned().collect();
+                Ok(Command::SRem(key.clone(), members))
+            },
+            ("smembers", [key]) => Ok(Command::SMembers(key.clone())),
+            // 通用类型的枚举
             ("expire", [key, secs]) => {
                 let s = secs.parse::<u64>().map_err(|_| "invalid expire time")?;
                 Ok(Command::Expire(key.clone(), s))
@@ -72,7 +118,7 @@ impl Command {
             Command::Set(key, value, seconds) => {
                 Self::write_operation(db, |db_write| {
                     let expires_at = seconds.map(|s| Instant::now() + Duration::from_secs(s));
-                    db_write.insert(key.to_string(), Entry { value: value.to_string(), expires_at });
+                    db_write.insert(key.to_string(), Entry { value: RedisValue::String(value.to_string()), expires_at });
                     (Frame::Simple("OK".to_string()), true)
                 }).await
             },
@@ -83,7 +129,17 @@ impl Command {
                             db_write.remove(key);
                             (Frame::Null, true)
                         } else {
-                            (Frame::Bulk(entry.value.clone()), false)
+                            // 2. 类型检查：只有 String 类型才能被 GET
+                            match &entry.value {
+                                RedisValue::String(s) => {
+                                    (Frame::Bulk(s.clone()), false)
+                                }
+                                // 3. 如果是 List, Hash 或 Set，返回 WRONGTYPE 错误
+                                _ => (
+                                    Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                                    false
+                                ),
+                            }
                         }
                     } else {
                         (Frame::Null, false)
@@ -165,16 +221,23 @@ impl Command {
             },
             Command::Append(key, value) => {
                 Self::write_operation(db, |db_write| {
-                    let s = db_write.entry(key.clone()).or_insert_with(Entry::new);
-                    s.value.push_str(value);
-                    let len = s.value.len();
-                    (Frame::Integer(len as i64), true)
+                    let s = db_write.entry(key.clone()).or_insert_with(Entry::new_string);
+                    match &mut s.value {
+                        RedisValue::String(s) => {
+                            s.push_str(&value);
+                            (Frame::Integer(s.len() as i64), true)
+                        },
+                        _ => (Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()), false),
+                    }
                 }).await
             },
             Command::Strlen(key) => {
                 Self::read_operation(db, |db_read| {
                     match db_read.get(key) {
-                        Some(v) => (Frame::Integer(v.value.len() as i64), false),
+                        Some(v) => match &v.value {
+                            RedisValue::String(s) => (Frame::Integer(s.len() as i64), false),
+                            _ => (Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()), false),
+                        }
                         None => (Frame::Integer(0), false)
                     }
                 }).await
@@ -184,18 +247,21 @@ impl Command {
                     match (start.parse::<usize>(), end.parse::<usize>()) {
                         (Ok(start_idx), Ok(end_idx)) => {
                             match db_read.get(key) {
-                                Some(v) => {
-                                    let bytes = v.value.as_bytes();
-                                    let len = bytes.len();
-                                    // 处理负数索引
-                                    let start_idx = if start_idx > len { len } else { start_idx };
-                                    let end_idx = if end_idx >= len { len - 1 } else { end_idx };
-                                    if start_idx > end_idx {
-                                        (Frame::Bulk("".to_string()), false)
-                                    } else {
-                                        let substring = String::from_utf8_lossy(&bytes[start_idx..=end_idx]);
-                                        (Frame::Bulk(substring.to_string()), false)
-                                    }
+                                Some(v) => match &v.value {
+                                    RedisValue::String(s) => {
+                                        let bytes = s.as_bytes();
+                                        let len = bytes.len();
+                                        // 处理负数索引
+                                        let start_idx = if start_idx > len { len } else { start_idx };
+                                        let end_idx = if end_idx >= len { len - 1 } else { end_idx };
+                                        if start_idx > end_idx {
+                                            (Frame::Bulk("".to_string()), false)
+                                        } else {
+                                            let substring = String::from_utf8_lossy(&bytes[start_idx..=end_idx]);
+                                            (Frame::Bulk(substring.to_string()), false)
+                                        }
+                                    },
+                                    _ => (Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()), false),
                                 },
                                 None => (Frame::Null, false),
                             }
@@ -204,6 +270,187 @@ impl Command {
                     }
                 }).await
             },
+
+            Command::LPUSH(key, values) => {
+                Self::write_operation(db, |db_write| {
+                    // 如果不存在，创建一个新的 RedisValue::List
+                    let entry = db_write.entry(key.clone()).or_insert_with(|| Entry {
+                        value: RedisValue::List(VecDeque::new()),
+                        expires_at: None,
+                    });
+
+                    match &mut entry.value {
+                        RedisValue::List(list) => {
+                            for v in values {
+                                list.push_front(v.to_string()); // 从左侧依次推入
+                            }
+                            (Frame::Integer(list.len() as i64), true)
+                        }
+                        // 如果这个 key 已经存了 String，就报错
+                        _ => (Frame::Error("WRONGTYPE ...".into()), false),
+                    }
+                }).await
+            },
+            Command::LPOP(key) => {
+                Self::write_operation(db, |db_write| {
+                    if let Some(entry) = db_write.get_mut(key) {
+                        match &mut entry.value {
+                            RedisValue::List(list) => {
+                                match list.pop_front() {
+                                    Some(val) => (Frame::Bulk(val), true),
+                                    None => (Frame::Null, false), // 列表空了
+                                }
+                            }
+                            _ => (Frame::Error("WRONGTYPE ...".into()), false),
+                        }
+                    } else {
+                        (Frame::Null, false) // Key 不存在
+                    }
+                }).await
+            },
+            Command::LRANGE(key, start, end) => {
+                Self::read_operation(db, |db_read| {
+                    match db_read.get(key) {
+                        Some(entry) => match &entry.value {
+                            RedisValue::List(list) => {
+                                let len = list.len() as i64;
+                                if len == 0 { return (Frame::Array(vec![]), false); }
+
+                                // --- 核心逻辑：处理负数和越界 ---
+                                let mut s = if *start < 0 { len + start } else { *start };
+                                let mut e = if *end < 0 { len + end } else { *end };
+
+                                // 规范化范围
+                                if s < 0 { s = 0; }
+                                if e >= len { e = len - 1; }
+
+                                if s > e || s >= len {
+                                    (Frame::Array(vec![]), false)
+                                } else {
+                                    // 提取范围内的元素
+                                    let frames = list.iter()
+                                        .skip(s as usize)
+                                        .take((e - s + 1) as usize)
+                                        .map(|v| Frame::Bulk(v.clone()))
+                                        .collect();
+                                    (Frame::Array(frames), false)
+                                }
+                            }
+                            _ => (Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()), false),
+                        },
+                        None => (Frame::Array(vec![]), false),
+                    }
+                }).await
+            },
+
+            Command::HSet(key, field, value) => {
+                Self::write_operation(db, |db_write| {
+                    let entry = db_write.entry(key.clone()).or_insert_with(|| Entry {
+                        value: RedisValue::Hash(HashMap::new()),
+                        expires_at: None,
+                    });
+
+                    match &mut entry.value {
+                        RedisValue::Hash(map) => {
+                            map.insert(field.clone(), value.clone());
+                            (Frame::Integer(1), true) // 返回 1 表示设置成功
+                        }
+                        _ => (Frame::Error("WRONGTYPE ...".into()), false),
+                    }
+                }).await
+            },
+            Command::HGet(key, field) => {
+                Self::read_operation(db, |db_read| {
+                    match db_read.get(key) {
+                        Some(entry) => match &entry.value {
+                            RedisValue::Hash(map) => {
+                                match map.get(field) {
+                                    Some(val) => (Frame::Bulk(val.clone()), false),
+                                    None => (Frame::Null, false),
+                                }
+                            }
+                            _ => (Frame::Error("WRONGTYPE ...".into()), false),
+                        },
+                        None => (Frame::Null, false),
+                    }
+                }).await
+            },
+            Command::HGetAll(key) => {
+                Self::read_operation(db, |db_read| {
+                    match db_read.get(key) {
+                        Some(entry) => match &entry.value {
+                            RedisValue::Hash(map) => {
+                                let mut frames = Vec::new();
+                                for (f, v) in map {
+                                    frames.push(Frame::Bulk(f.clone()));
+                                    frames.push(Frame::Bulk(v.clone()));
+                                }
+                                (Frame::Array(frames), false)
+                            }
+                            _ => (Frame::Error("WRONGTYPE ...".into()), false),
+                        },
+                        None => (Frame::Array(vec![]), false),
+                    }
+                }).await
+            },
+
+            Command::SAdd(key, members) => {
+                Self::write_operation(db, |db_write| {
+                    let entry = db_write.entry(key.clone()).or_insert_with(|| Entry {
+                        value: RedisValue::Set(HashSet::new()),
+                        expires_at: None,
+                    });
+                    match &mut entry.value {
+                        RedisValue::Set(set) => {
+                            let mut added = 0;
+                            for m in members {
+                                if set.insert(m.clone()) {
+                                    added += 1;
+                                }
+                            }
+                            (Frame::Integer(added), added > 0) // 只有真正新增了才算 dirty
+                        }
+                        _ => (Frame::Error("WRONGTYPE ...".into()), false),
+                    }
+                }).await
+            },
+            Command::SRem(key, members) => {
+                Self::write_operation(db, |db_write| {
+                    if let Some(entry) = db_write.get_mut(key) {
+                        match &mut entry.value {
+                            RedisValue::Set(set) => {
+                                let mut removed = 0;
+                                for m in members {
+                                    if set.remove(m) {
+                                        removed += 1;
+                                    }
+                                }
+                                (Frame::Integer(removed), removed > 0)
+                            }
+                            _ => (Frame::Error("WRONGTYPE ...".into()), false),
+                        }
+                    } else {
+                        (Frame::Integer(0), false) // Key 不存在，移除 0 个
+                    }
+                }).await
+            },
+            Command::SMembers(key) => {
+                Self::read_operation(db, |db_read| {
+                    match db_read.get(key) {
+                        Some(entry) => match &entry.value {
+                            RedisValue::Set(set) => {
+                                let frames = set.iter()
+                                    .map(|m| Frame::Bulk(m.clone()))
+                                    .collect();
+                                (Frame::Array(frames), false)
+                            }
+                            _ => (Frame::Error("WRONGTYPE ...".into()), false),
+                        },
+                        None => (Frame::Array(vec![]), false),
+                    }
+                }).await
+            },
+
             Command::Info => {
                 // 不用闭包，用守卫操作
                 let read_guard = db.read().await;
@@ -241,15 +488,22 @@ impl Command {
 
     async fn execute_number(db: &Db, key: &String, increment: i64) -> (Frame, bool) {
         Self::write_operation(db, |db_map| {
-            // 获取原数据的时间戳
-            let instant = db_map.get(key)
-                .map_or(None, |entry| entry.expires_at);
-            let current = db_map.get(key)
-                        .and_then(|v| v.value.parse::<i64>().ok())
-                        .unwrap_or(0);
-            let next_value = current + increment;
-            db_map.insert(key.to_string(), Entry { value: next_value.to_string(), expires_at: instant });
-            (Frame::Integer(next_value), true)
+            let entry = db_map.entry(key.to_string()).or_insert_with(|| 
+                Entry { value: RedisValue::String("0".to_string()), expires_at: None, }
+            );
+
+            match &mut entry.value {
+                RedisValue::String(ref mut s) => {
+                    let current = s.parse::<i64>().unwrap_or(0);
+                    let next_value = current + increment;
+                    *s = next_value.to_string();
+                    (Frame::Integer(next_value), true)
+                },
+                _ => (
+                    Frame::Error("WRONGTYPE Operation against a key holding the wrong kind of value".into()),
+                    false
+                ),
+            }
         }).await
     }
 

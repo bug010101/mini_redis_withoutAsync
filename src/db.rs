@@ -1,11 +1,29 @@
-use std::{sync::Arc, time::Instant};
+use std::{ sync::Arc, time::Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "t", content = "v")] // t: type; v: value
+pub enum RedisValue {
+    #[serde(rename = "s")]
+    String(String),
+    
+    #[serde(rename = "l")]
+    List(VecDeque<String>),
+    
+    #[serde(rename = "h")]
+    Hash(HashMap<String, String>),
+    
+    #[serde(rename = "set")]
+    Set(HashSet<String>),
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
-    pub value: String,
+    pub value: RedisValue,
     // 使用Instant记录过期时刻，None表示永久有效
     #[serde(with = "timestamp_format")]
     pub expires_at: Option<Instant>,
@@ -51,8 +69,8 @@ mod timestamp_format {
 }
 
 impl Entry {
-    pub fn new() -> Self {
-        Self { value: String::new(), expires_at: None }
+    pub fn new_string() -> Self {
+        Self { value: RedisValue::String(String::new()), expires_at: None }
     }
 }
 
