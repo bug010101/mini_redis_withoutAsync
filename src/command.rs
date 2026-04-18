@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::db::{BaseDb, Db, Entry};
+use crate::{db::{BaseDb, Db, Entry}, protocol::Frame};
 
 #[derive(Debug)]
 pub enum Command {
@@ -23,45 +23,57 @@ pub enum Command {
 
 
 impl Command {
-    /// 解析&str类型的命令，返回Result<Command, String>类型
-    /// 1、将&str根据空格划分为数组
-    /// 2、对数组进行切片获取每部分，对比获取对应的枚举类型
-    pub fn from_str(line: &str) -> Result<Self, String> {
-        let parts:Vec<&str> = line.split_whitespace().collect();
-        match parts.as_slice() {
-            ["set", key, value] => Ok(Command::Set(key.to_string(), value.to_string(), None)),
-            ["set", key, value, ex] => {
-                let secs = ex.parse::<u64>().map_err(|_| "invalid expire time")?;
-                Ok(Command::Set(key.to_string(), value.to_string(), Some(secs)))
+    pub fn from_frames(frames: Vec<Frame>) -> Result<Self, String> {
+        let mut parts = Vec::new();
+        for frame in frames {
+            match frame {
+                // RESP 命令通常由 Bulk String 组成
+                Frame::Bulk(s) | Frame::Simple(s) => parts.push(s),
+                _ => return Err("Protocol error: expected bulk string in array".to_string()),
+            }
+        }
+        if parts.is_empty() {
+            return Err("Empty command".to_string());
+        }
+        // 核心：仅将第一个元素（命令名）转为小写
+        let command_name = parts[0].to_lowercase();
+        let args = &parts[1..];
+
+        match (command_name.as_str(), args) {
+            ("set", [key, value]) => Ok(Command::Set(key.clone(), value.clone(), None)),
+            ("set", [key, value, ex, secs]) if ex.to_lowercase() == "ex" => {
+                let s = secs.parse::<u64>().map_err(|_| "invalid expire time")?;
+                Ok(Command::Set(key.clone(), value.clone(), Some(s)))
             },
-            ["get", key] => Ok(Command::Get(key.to_string())),
-            ["del", key] => Ok(Command::Del(key.to_string())),
-            ["exists", key] => Ok(Command::Exists(key.to_string())),
-            ["incr", key] => Ok(Command::Incr(key.to_string())),
-            ["decr", key] => Ok(Command::Decr(key.to_string())),
-            ["incrby", key, value] => Ok(Command::Incrby(key.to_string(), value.to_string())),
-            ["decrby", key, value] => Ok(Command::Decrby(key.to_string(), value.to_string())),
-            ["append", key, value] => Ok(Command::Append(key.to_string(), value.to_string())),
-            ["strlen", key] => Ok(Command::Strlen(key.to_string())),
-            ["getrange", key, start, end] => Ok(Command::Getrange(key.to_string(), start.to_string(), end.to_string())),
-            ["info"] => Ok(Command::Info),
-            ["exit"] => Ok(Command::Exit),
-            ["ping"] => Ok(Command::Ping),
-            _ => Err("unknown command".to_string()),
+            ("get", [key]) => Ok(Command::Get(key.clone())),
+            ("del", [key]) => Ok(Command::Del(key.clone())),
+            ("exists", [key]) => Ok(Command::Exists(key.clone())),
+            ("incr", [key]) => Ok(Command::Incr(key.clone())),
+            ("decr", [key]) => Ok(Command::Decr(key.clone())),
+            ("incrby", [key, val]) => Ok(Command::Incrby(key.clone(), val.clone())),
+            ("decrby", [key, val]) => Ok(Command::Decrby(key.clone(), val.clone())),
+            ("append", [key, val]) => Ok(Command::Append(key.clone(), val.clone())),
+            ("strlen", [key]) => Ok(Command::Strlen(key.clone())),
+            ("getrange", [key, start, end]) => Ok(Command::Getrange(key.clone(), start.clone(), end.clone())),
+            ("expire", [key, secs]) => {
+                let s = secs.parse::<u64>().map_err(|_| "invalid expire time")?;
+                Ok(Command::Expire(key.clone(), s))
+            },
+            ("ping", []) => Ok(Command::Ping),
+            ("info", []) => Ok(Command::Info),
+            ("exit", []) => Ok(Command::Exit),
+            _ => Err(format!("unknown command or wrong arguments: {}", command_name)),
         }
     }
 
-    /// 输入一个处理好的命令，执行命令
-    /// 1、匹配枚举类型
-    /// 2、执行对应的数据库操作
-    /// 3、返回String, bool类型
-    pub async fn execute(&self, db: &Db) -> (String, bool) {
+
+    pub async fn execute(&self, db: &Db) -> (Frame, bool) {
         match self {
             Command::Set(key, value, seconds) => {
                 Self::write_operation(db, |db_write| {
                     let expires_at = seconds.map(|s| Instant::now() + Duration::from_secs(s));
                     db_write.insert(key.to_string(), Entry { value: value.to_string(), expires_at });
-                    ("+OK\r\n".to_string(), true)
+                    (Frame::Simple("OK".to_string()), true)
                 }).await
             },
             Command::Get(key) => {
@@ -69,21 +81,21 @@ impl Command {
                     if let Some(entry) = db_write.get(key) {
                         if Self::is_expired(entry) {
                             db_write.remove(key);
-                            ("$-1\r\n".to_string(), true)
+                            (Frame::Null, true)
                         } else {
-                            (format!("${}\r\n{}\r\n", entry.value.len(), entry.value), false)
+                            (Frame::Bulk(entry.value.clone()), false)
                         }
                     } else {
-                        ("$-1\r\n".to_string(), false)
+                        (Frame::Null, false)
                     }
                 }).await
             },
             Command::Del(key) => {
                 Self::write_operation(db, |db_del| {
                     if db_del.remove(key).is_some() {
-                        (":1\r\n".to_string(), true)
+                        (Frame::Integer(1), true)
                     } else {
-                        (":0\r\n".to_string(), false)
+                        (Frame::Integer(0), false)
                     }
                 }).await
             },
@@ -92,12 +104,12 @@ impl Command {
                     if let Some(entry) = db_exists.get(key) {
                         if Self::is_expired(entry) {
                             db_exists.remove(key);
-                            ("$-1\r\n".to_string(), true)
+                            (Frame::Null, true)
                         } else {
-                            (":1\r\n".to_string(), false)
+                            (Frame::Integer(1), false)
                         }
                     } else {
-                        (":0\r\n".to_string(), false)
+                        (Frame::Integer(0), false)
                     }
                 }).await
             },
@@ -133,7 +145,7 @@ impl Command {
                     Ok(value) => {
                         Command::execute_number(db, key, value).await
                     },
-                    Err(_) => (format!("-ERR value is not an integer or out of range\r\n"), false),
+                    Err(_) => (Frame::Error("value is not an integer or out of range".to_string()), false),
                 }
             },
             Command::Decrby(key, decrement ) => {
@@ -148,24 +160,22 @@ impl Command {
                     Ok(value) => {
                         Command::execute_number(db, key, -value).await
                     },
-                    Err(_) => (format!("-ERR value is not an integer or out of range\r\n"), false),
+                    Err(_) => (Frame::Error("value is not an integer or out of range".to_string()), false),
                 }
             },
             Command::Append(key, value) => {
                 Self::write_operation(db, |db_write| {
-                    // let current = db_write.get(key).cloned().unwrap_or_default();
-                    // let next_value = format!("{}{}", current, value);
                     let s = db_write.entry(key.clone()).or_insert_with(Entry::new);
                     s.value.push_str(value);
                     let len = s.value.len();
-                    (format!(":{}\r\n", len), true)
+                    (Frame::Integer(len as i64), true)
                 }).await
             },
             Command::Strlen(key) => {
                 Self::read_operation(db, |db_read| {
                     match db_read.get(key) {
-                        Some(v) => (format!(":{}\r\n", v.value.len()), false),
-                        None => (format!(":0\r\n"), false)
+                        Some(v) => (Frame::Integer(v.value.len() as i64), false),
+                        None => (Frame::Integer(0), false)
                     }
                 }).await
             },
@@ -181,16 +191,16 @@ impl Command {
                                     let start_idx = if start_idx > len { len } else { start_idx };
                                     let end_idx = if end_idx >= len { len - 1 } else { end_idx };
                                     if start_idx > end_idx {
-                                        ("$0\r\n\r\n".to_string(), false)
+                                        (Frame::Bulk("".to_string()), false)
                                     } else {
                                         let substring = String::from_utf8_lossy(&bytes[start_idx..=end_idx]);
-                                        (format!("${}\r\n{}\r\n", substring.len(), substring), false)
+                                        (Frame::Bulk(substring.to_string()), false)
                                     }
                                 },
-                                None => ("$-1\r\n".to_string(), false),
+                                None => (Frame::Null, false),
                             }
                         },
-                        _ => (format!("-ERR value is not an integer or out of range\r\n"), false),
+                        _ => (Frame::Error("value is not an integer or out of range".to_string()), false),
                     }
                 }).await
             },
@@ -208,28 +218,28 @@ impl Command {
                     read_guard.len(),
                     expires_count
                 );
-                (format!("${}\r\n{}\r\n", info_content.len(), info_content), false)
+                (Frame::Bulk(info_content), false)
             },
             Command::Ping => {
-                ("+Pong\r\n".to_string(), false)
+                (Frame::Simple("PONG".to_string()), false)
             }
             Command::Exit => {
-                ("+Ok\r\n".to_string(), false)
+                (Frame::Simple("OK".to_string()), false)
             },
             Command::Expire(key, seconds) => {
                 Self::write_operation(db, |db_write| {
                     if let Some(entry) = db_write.get_mut(key) {
                         entry.expires_at = Some(Instant::now() + Duration::from_secs(*seconds));
-                        (":1\r\n".to_string(), true)
+                        (Frame::Integer(1), true)
                     } else {
-                        (":0\r\n".to_string(), false)
+                        (Frame::Integer(0), false)
                     }
                 }).await
             },
         }
     }
 
-    async fn execute_number(db: &Db, key: &String, increment: i64) -> (String, bool) {
+    async fn execute_number(db: &Db, key: &String, increment: i64) -> (Frame, bool) {
         Self::write_operation(db, |db_map| {
             // 获取原数据的时间戳
             let instant = db_map.get(key)
@@ -239,7 +249,7 @@ impl Command {
                         .unwrap_or(0);
             let next_value = current + increment;
             db_map.insert(key.to_string(), Entry { value: next_value.to_string(), expires_at: instant });
-            (format!(":{}\r\n", next_value), true)
+            (Frame::Integer(next_value), true)
         }).await
     }
 

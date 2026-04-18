@@ -1,5 +1,5 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use crate::command::Command;
 use crate::db::Db;
 use crate::persistence::{self, PersistenceConfig};
+use crate::protocol::Frame;
 
 
 /// 全局变更计数器
@@ -96,37 +97,81 @@ pub async fn run_server() -> tokio::io::Result<()>{
 /// 3、将输入的命令进行处理，判断，解析，执行
 /// 4、将处理的命令传回连接返回给客户端
 async fn handle_stream(mut stream: TcpStream, db: Db) -> tokio::io::Result<()>{
-    let (reader, mut writer) = stream.split();
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break;
-        }
-        let trimed_cmd = line.trim();
-        if trimed_cmd.is_empty() {
-            continue;
-        }
-        let command = Command::from_str(trimed_cmd);
-        let is_exit = matches!(command, Ok(Command::Exit));
-        let response = match command{
-            Ok(cmd) => {
-                let (resp, dirty) = cmd.execute(&db).await;
-                if dirty {
-                    DIRTY_COUNT.fetch_add(1, Ordering::Relaxed);
-                }
-                resp
-            },
-            Err(e) => format!("-ERR {}\r\n", e),
+        let frame = match read_frame(&mut stream).await? {
+            Some(f) => f,
+            None => break, 
         };
-        // 异步写回
-        writer.write_all(response.as_bytes()).await?;
-        if is_exit {
-            println!("客户端请求退出");
-            break;
+
+        if let Frame::Array(frames) = frame {
+            match Command::from_frames(frames) {
+                Ok(cmd) => {
+                    let (res_frame, dirty) = cmd.execute(&db).await;
+                    if dirty {
+                        DIRTY_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    // 调用 Frame 自己的序列化方法
+                    stream.write_all(&res_frame.to_bytes()).await?;
+                },
+                Err(e) => {
+                    let err_frame = Frame::Error(e);
+                    stream.write_all(&err_frame.to_bytes()).await?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// 辅助函数：根据 RESP 首字节递归解析 Frame
+async fn read_frame(stream: &mut TcpStream) -> tokio::io::Result<Option<Frame>> {
+    let mut prefix = [0u8; 1];
+    if stream.read_exact(&mut prefix).await.is_err() {
+        return Ok(None);
+    }
+
+    match prefix[0] {
+        b'*' => { // 解析数组
+            let len = read_decimal(stream).await?;
+            let mut frames = Vec::with_capacity(len as usize);
+            for _ in 0..len {
+                if let Some(f) = Box::pin(read_frame(stream)).await? {
+                    frames.push(f);
+                }
+            }
+            Ok(Some(Frame::Array(frames)))
+        }
+        b'$' => { // 解析 Bulk String
+            let len = read_decimal(stream).await?;
+            if len == -1 { return Ok(Some(Frame::Null)); }
+            
+            let mut data = vec![0u8; len as usize];
+            stream.read_exact(&mut data).await?;
+            stream.read_exact(&mut [0u8; 2]).await?; // 跳过 \r\n
+            Ok(Some(Frame::Bulk(String::from_utf8_lossy(&data).to_string())))
+        }
+        b'+' => Ok(Some(Frame::Simple(read_line(stream).await?))),
+        b':' => Ok(Some(Frame::Integer(read_decimal(stream).await?))),
+        _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Unsupported RESP type")),
+    }
+}
+
+/// 读取数字部分（直到 \r\n）
+async fn read_decimal(stream: &mut TcpStream) -> tokio::io::Result<i64> {
+    let line = read_line(stream).await?;
+    line.parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid number"))
+}
+
+/// 读取一行（直到 \r\n），返回字符串
+async fn read_line(stream: &mut TcpStream) -> tokio::io::Result<String> {
+    let mut line = Vec::new();
+    loop {
+        let b = stream.read_u8().await?;
+        if b == b'\r' {
+            let next = stream.read_u8().await?;
+            if next == b'\n' { break; }
+        }
+        line.push(b);
+    }
+    Ok(String::from_utf8_lossy(&line).to_string())
 }
