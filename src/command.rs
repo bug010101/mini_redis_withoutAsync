@@ -1,6 +1,8 @@
-use std::{collections::{HashMap, HashSet, VecDeque}, time::{Duration, Instant}};
+use std::{collections::{HashMap, HashSet, VecDeque}, sync::Arc, time::{Duration, Instant}};
 
-use crate::{db::{BaseDb, Db, Entry, RedisValue}, protocol::Frame};
+use tokio::{io::AsyncWriteExt, net::TcpStream};
+
+use crate::{db::{BaseDb, Db, Entry, PubSubManager, RedisValue}, protocol::Frame};
 
 #[derive(Debug)]
 pub enum Command {
@@ -36,10 +38,77 @@ pub enum Command {
     Exit,
     Ping,
     Expire(String, u64),
+
+    // 发布订阅模式的命令
+    Subscribe(String),
+    Publish(String, String),
 }
 
 
 impl Command {
+    /// 【新入口】分发命令：它是 handle_stream 直接调用的对象
+    pub async fn apply(
+        self, 
+        db: &Db, 
+        pubsub: &Arc<PubSubManager>, // 传入广播管理器
+        stream: &mut TcpStream
+    ) -> tokio::io::Result<()> {
+        match self {
+            // 优雅拦截：Subscribe 是“流式”的，直接接管 stream
+            Command::Subscribe(channel) => {
+                Self::handle_subscribe(stream, pubsub, channel).await
+            }
+            // 其余所有命令：都是“请求-响应”式的，走 execute
+            other => {
+                let (res_frame, dirty) = other.execute(db, pubsub).await;
+                if dirty {
+                    // 这里处理DIRTY_COUNT
+                    crate::server::DIRTY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                stream.write_all(&res_frame.to_bytes()).await
+            }
+        }
+    }
+
+    async fn handle_subscribe(
+        stream: &mut TcpStream, 
+        pubsub: &Arc<PubSubManager>, 
+        channel: String
+    ) -> tokio::io::Result<()> {
+        let mut rx = pubsub.subscribe(channel.clone()).await;
+        
+        // 1. 发送订阅成功确认
+        let confirm = Frame::Array(vec![
+            Frame::Bulk("subscribe".into()),
+            Frame::Bulk(channel.clone()),
+            Frame::Integer(1),
+        ]);
+        stream.write_all(&confirm.to_bytes()).await?;
+
+        // 2. 持续推送消息
+        loop {
+            tokio::select! {
+                msg_res = rx.recv() => {
+                    if let Ok(msg) = msg_res {
+                        let push = Frame::Array(vec![
+                            Frame::Bulk("message".into()),
+                            Frame::Bulk(channel.clone()),
+                            Frame::Bulk(msg),
+                        ]);
+                        stream.write_all(&push.to_bytes()).await?;
+                    }
+                }
+                // 必须检查连接是否断开，否则会造成内存泄露
+                _ = stream.readable() => {
+                    let mut buf = [0; 1];
+                    if stream.try_read(&mut buf).is_ok() && buf[0] == 0 {
+                        return Ok(()); 
+                    }
+                }
+            }
+        }
+    }
+
     pub fn from_frames(frames: Vec<Frame>) -> Result<Self, String> {
         let mut parts = Vec::new();
         for frame in frames {
@@ -108,12 +177,15 @@ impl Command {
             ("ping", []) => Ok(Command::Ping),
             ("info", []) => Ok(Command::Info),
             ("exit", []) => Ok(Command::Exit),
+            // 发布订阅模式的枚举
+            ("subscribe", [channel]) => Ok(Command::Subscribe(channel.clone())),
+            ("publish", [channel, message]) => Ok(Command::Publish(channel.clone(), message.clone())),
             _ => Err(format!("unknown command or wrong arguments: {}", command_name)),
         }
     }
 
 
-    pub async fn execute(&self, db: &Db) -> (Frame, bool) {
+    pub async fn execute(&self, db: &Db, pubsub: &Arc<PubSubManager>) -> (Frame, bool) {
         match self {
             Command::Set(key, value, seconds) => {
                 Self::write_operation(db, |db_write| {
@@ -483,6 +555,13 @@ impl Command {
                     }
                 }).await
             },
+
+            Command::Publish(channel, message) => {
+                let count = pubsub.publish(&channel, message.to_string()).await;
+                (Frame::Integer(count as i64), false)
+            },
+            // 告诉编译器：Subscribe 永远不会走到这里
+            Command::Subscribe(_) => unreachable!("Subscribe should be handled by Command::apply"),
         }
     }
 

@@ -5,19 +5,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::RwLock;
 use crate::command::Command;
-use crate::db::Db;
+use crate::db::{Db, PubSubManager};
 use crate::persistence::{self, PersistenceConfig};
 use crate::protocol::Frame;
 
 
 /// 全局变更计数器
-static DIRTY_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static DIRTY_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub async fn run_server() -> tokio::io::Result<()>{
     let config = PersistenceConfig::default(); // 初始化rdb配置
     let base_db = persistence::load_from_rdb(&config.rdb_path).await;
     let db: Db = Arc::new(RwLock::new(base_db)); // 生成数据库对象
-    
+    let pubsub = Arc::new(PubSubManager::new()); // 初始化广播管理器
     // 启动定时持久化任务
     let db_clone = Arc::clone(&db);
     let config_clone = config.clone();
@@ -81,9 +81,9 @@ pub async fn run_server() -> tokio::io::Result<()>{
         };
         println!("socket_addr in on {:?}", socket_addr);
         let db_clone = Arc::clone(&db);
-        
+        let pubsub_clone = Arc::clone(&pubsub); // 每次循环都克隆一个新的 Arc 指针
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(stream, db_clone).await {
+            if let Err(e) = handle_stream(stream, db_clone, pubsub_clone).await {
                 eprintln!("Error handling connection: {}", e);
             }
         });
@@ -96,27 +96,33 @@ pub async fn run_server() -> tokio::io::Result<()>{
 /// 2、开启循环，读取每个命令直到没有任何命令输入为止
 /// 3、将输入的命令进行处理，判断，解析，执行
 /// 4、将处理的命令传回连接返回给客户端
-async fn handle_stream(mut stream: TcpStream, db: Db) -> tokio::io::Result<()>{
+async fn handle_stream(mut stream: TcpStream, db: Db, pubsub: Arc<PubSubManager>) -> tokio::io::Result<()> {
     loop {
+        // 1. 读取并解析 Frame
         let frame = match read_frame(&mut stream).await? {
             Some(f) => f,
             None => break, 
         };
 
-        if let Frame::Array(frames) = frame {
-            match Command::from_frames(frames) {
-                Ok(cmd) => {
-                    let (res_frame, dirty) = cmd.execute(&db).await;
-                    if dirty {
-                        DIRTY_COUNT.fetch_add(1, Ordering::Relaxed);
-                    }
-                    // 调用 Frame 自己的序列化方法
-                    stream.write_all(&res_frame.to_bytes()).await?;
-                },
-                Err(e) => {
-                    let err_frame = Frame::Error(e);
-                    stream.write_all(&err_frame.to_bytes()).await?;
+        // 2. 将 Frame 转为 Command
+        let frames = match frame {
+            Frame::Array(f) => f,
+            _ => {
+                stream.write_all(&Frame::Error("ERR protocol error".into()).to_bytes()).await?;
+                continue;
+            }
+        };
+
+        match Command::from_frames(frames) {
+            Ok(cmd) => {
+                // 3. 优雅分发：一句话搞定所有类型的命令
+                if let Err(e) = cmd.apply(&db, &pubsub, &mut stream).await {
+                    eprintln!("Command execution error: {:?}", e);
+                    break;
                 }
+            },
+            Err(e) => {
+                stream.write_all(&Frame::Error(e).to_bytes()).await?;
             }
         }
     }
