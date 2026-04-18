@@ -130,7 +130,7 @@ async fn handle_stream(mut stream: TcpStream, db: Db, pubsub: Arc<PubSubManager>
 }
 
 /// 辅助函数：根据 RESP 首字节递归解析 Frame
-async fn read_frame(stream: &mut TcpStream) -> tokio::io::Result<Option<Frame>> {
+pub async fn read_frame(stream: &mut TcpStream) -> tokio::io::Result<Option<Frame>> {
     let mut prefix = [0u8; 1];
     if stream.read_exact(&mut prefix).await.is_err() {
         return Ok(None);

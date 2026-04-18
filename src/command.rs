@@ -70,6 +70,7 @@ impl Command {
         }
     }
 
+    
     async fn handle_subscribe(
         stream: &mut TcpStream, 
         pubsub: &Arc<PubSubManager>, 
@@ -88,25 +89,42 @@ impl Command {
         // 2. 持续推送消息
         loop {
             tokio::select! {
+                // 监控一：频道消息推送
                 msg_res = rx.recv() => {
-                    if let Ok(msg) = msg_res {
-                        let push = Frame::Array(vec![
-                            Frame::Bulk("message".into()),
-                            Frame::Bulk(channel.clone()),
-                            Frame::Bulk(msg),
-                        ]);
-                        stream.write_all(&push.to_bytes()).await?;
+                    match msg_res {
+                        Ok(msg) => {
+                            let push = Frame::Array(vec![
+                                Frame::Bulk("message".into()),
+                                Frame::Bulk(channel.clone()),
+                                Frame::Bulk(msg),
+                            ]);
+                            stream.write_all(&push.to_bytes()).await?;
+                        }
+                        Err(_) => break, // 频道关闭或积压严重
                     }
                 }
-                // 必须检查连接是否断开，否则会造成内存泄露
-                _ = stream.readable() => {
-                    let mut buf = [0; 1];
-                    if stream.try_read(&mut buf).is_ok() && buf[0] == 0 {
-                        return Ok(()); 
+                // 监控二：客户端行为
+                // 使用你现有的 read_frame 函数（假设它在 server.rs 中）
+                frame_res = crate::server::read_frame(stream) => {
+                    match frame_res {
+                        // 只要读到了合法的 Frame（不管是 exit 还是别的），说明客户端打破了静默订阅状态
+                        Ok(Some(_frame)) => {
+                            // 如果你想支持退出，这里直接 break
+                            // 如果想更严谨，可以判断 _frame 是否是 Command::Exit
+                            break; 
+                        }
+                        // 读到 None 说明客户端断开连接 (EOF)
+                        Ok(None) => break,
+                        // 读到错误说明网络异常
+                        Err(_) => break,
                     }
                 }
             }
         }
+        
+        // 退出循环后，函数结束，rx 自动销毁，引用计数自动处理
+        println!("Subscriber on channel '{}' disconnected.", channel);
+        Ok(())
     }
 
     pub fn from_frames(frames: Vec<Frame>) -> Result<Self, String> {

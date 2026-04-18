@@ -1,121 +1,101 @@
+***
+# Mini-Redis-Rust
 
+这是一个使用 Rust 语言和 `tokio` 异步运行时实现的轻量级 Redis 服务器。它完整实现了 Redis 序列化协议 (RESP)，并支持高性能的并发命令处理、数据持久化以及实时的发布/订阅功能。
 
-# Mini Redis
+## 🚀 技术亮点
 
-一个用 Rust 实现的简单 Redis 服务器（异步版本），支持基本 Redis 协议命令。
+* **全异步架构**：基于 `Tokio` 运行时，利用 `async/await` 实现高并发连接处理。
+* **零拷贝思想**：在协议解析过程中尽可能减少内存拷贝，提升吞吐量。
+* **线程安全**：使用 `Arc<RwLock<T>>` 确保多线程环境下内存数据库的安全访问。
+* **发布/订阅机制**：利用 `tokio::sync::broadcast` 实现高性能的消息分发，并使用 `tokio::select!` 优化了连接的健壮性。
+* **二进制安全**：RESP 协议实现支持任何二进制数据（如中文、图片字节流等）。
 
-## 功能特性
+## 🛠 已实现功能
 
-### 字符串命令
-- `set key value` - 设置键值对
-- `get key` - 获取值
-- `del key` - 删除键
-- `exists key` - 检查键是否存在
-- `append key value` - 在指定键的值后面追加内容
-- `strlen key` - 获取值的长度
-- `getrange key start end` - 获取指定区间的内容
+### 1. 基础键值操作 (Strings)
+* `SET key value [EX seconds]`：设置键值对，支持可选的过期时间。
+* `GET key`：获取指定键的值。
+* `DEL key`：删除键。
+* `EXISTS key`：检查键是否存在。
+* `INCR / DECR`：对数值进行自增/自减。
 
-### 数字命令
-- `incr key` - 数字值 + 1
-- `decr key` - 数字值 - 1
-- `incrby key value` - 数字值 + 指定值
-- `decrby key value` - 数字值 - 指定值
+### 2. 高级数据结构
+* **List (列表)**：支持 `LPUSH`、`LPOP`、`LRANGE`。
+* **Hash (哈希)**：支持 `HSET`、`HGET`、`HGETALL`。
+* **Set (集合)**：支持 `SADD`、`SREM`、`SMEMBERS`。
 
-### 服务命令
-- `info` - 获取服务器状态信息
+### 3. 发布/订阅 (Pub/Sub)
+* `SUBSCRIBE channel`：订阅频道，支持实时消息推送。
+* `PUBLISH channel message`：向指定频道发布消息。
 
-## 环境要求
+### 4. 系统功能
+* **持久化**：支持 RDB 快照功能，定时将内存数据以 JSON 格式保存到磁盘。
+* **生存时间 (TTL)**：支持 Key 的自动过期清理。
+* **PING**：心跳检测。
 
-- Rust 1.56+
-- Tokio 异步运行时
+## 📦 安装与运行
 
-## 编译
+### 环境要求
+* Rust 1.70.0 或更高版本
+* Cargo
 
+### 编译与启动
+1. 克隆项目：
+   ```bash
+   git clone https://github.com/bug010101/mini_redis_withoutAsync.git
+   cd mini_redis
+   ```
+2. 运行服务器：
+   ```bash
+   cargo run
+   ```
+   默认服务器将监听 `127.0.0.1:6379`。
+
+## 📖 使用教程
+
+你可以使用官方的 `redis-cli` 或者 `nc` (Netcat) 与服务器通信。
+
+### 使用 redis-cli 测试（推荐）
+
+**1. 基础存取：**
 ```bash
-# Debug 模式编译
-cargo build
-
-# Release 模式编译（推荐生产环境使用）
-cargo build --release
+redis-cli SET name "Rust"
+redis-cli GET name
 ```
 
-## 运行
+**2. 测试发布订阅：**
+* **窗口 A (订阅者):**
+    ```bash
+    redis-cli --raw SUBSCRIBE my_chat
+    ```
+* **窗口 B (发布者):**
+    ```bash
+    redis-cli PUBLISH my_chat "你好，Redis！"
+    ```
 
+### 使用 Netcat 手动发送 RESP 协议
+由于项目严格遵循 RESP 协议，你可以手动发送原始字节：
 ```bash
-# 默认监听 localhost:6379
-cargo run
-
-# 服务器启动后即可接收客户端连接
+printf "*2\r\n$4\r\nINFO\r\n" | nc localhost 6379
 ```
 
-## 测试
+## 📂 项目结构
 
-```bash
-# 运行所有测试用例
-cargo test
+```text
+src/
+├── main.rs          # 实例入口
+├── lib.rs           # 使用的crate
+├── server.rs        # TCP 监听、连接调度与协议处理
+├── db.rs            # 内存数据库模型与 Pub/Sub 管理器
+├── protocol.rs      # RESP 协议帧 (Frame) 的编解码逻辑
+├── command.rs       # 各类 Redis 命令的具体业务执行
+└── persistence.rs   # RDB 持久化逻辑 (JSON 序列化)
 ```
 
-## 客户端测试示例
+## 🛡 网络健壮性说明
+本项目在 `handle_subscribe` 中使用了 `tokio::select!` 宏，能够同时监听内部频道消息和客户端指令。当客户端意外断开或发送退出信号时，服务器能立即回收资源，避免了内存泄露和僵尸连接问题。
 
-使用 `nc` 命令连接服务器进行测试：
-
-```bash
-nc localhost 6379
-```
-
-### 基础操作
-
-```
-set mykey Hello
-get mykey
-exists mykey
-strlen mykey
-del mykey
-exists mykey
-```
-
-### 数字操作
-
-```
-set counter 10
-incr counter
-incrby counter 5
-decr counter
-decrby counter 3
-```
-
-### 字符串操作
-
-```
-set greeting Hello
-append greeting " World"
-getrange greeting 0 4
-strlen greeting
-info
-```
-
-## 项目结构
-
-```
-mini_redis_rs/
-├── src/
-│   ├── command.rs   # 命令解析与执行
-│   ├── db.rs       # 数据库存储实现
-│   ├── server.rs  # TCP 服务器
-│   ├── persistence.rs  # RDB 持久化
-│   ├── lib.rs     # 模块导出
-│   └── main.rs    # 程序入口
-├── tests/
-│   └── command_tests.rs  # 命令测试用例
-└── Cargo.toml
-```
-
-## 技术实现
-
-- **异步网络**: 使用 Tokio 异步运行时处理 TCP 连接
-- **数据存储**: 内存 HashMap 存储，支持字符串和整数类型
-- **持久化**: RDB 格式定期保存数据到磁盘
-
-## 许可证
-
-MIT License
+## ⚖ 许可证
+Apache License Version 2.0
+***
